@@ -1,0 +1,29 @@
+grid:
+  nx: 100
+  L: 100.0
+
+physics:
+  permeability: 1.0e-1
+  porosity: 0.5
+  water_viscosity: 1.0e-3
+  oil_viscosity: 1.0e-2
+  krw0: 0.3
+  kro0: 0.8
+  n_w: 2.0
+  n_o: 2.0
+  Swc: 0.2
+  Sor: 0.2
+
+time:
+  dt: 5.0e-4
+  t_max: 0.1
+
+boundary:
+  Sw_inlet: 0.8
+
+scheme:
+  type: upwind
+
+output:
+  plot: true
+  save_path: outputs/

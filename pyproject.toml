@@ -1,0 +1,14 @@
+[project]
+name = "spec_jax"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.10.0",
+    "jaxlib>=0.10.0",
+    "matplotlib>=3.10.9",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pyyaml>=6.0",
+]
