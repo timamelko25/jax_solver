@@ -1,6 +1,6 @@
 grid:
-  nx: 100
-  L: 100.0
+  nx: 50
+  L: 10.0
 
 physics:
   permeability: 1.0e-1
@@ -8,7 +8,7 @@ physics:
   water_viscosity: 1.0e-3
   oil_viscosity: 1.0e-2
   krw0: 0.3
-  kro0: 0.8
+  kro0: 1.0
   n_w: 2.0
   n_o: 2.0
   Swc: 0.2
@@ -19,7 +19,7 @@ time:
   t_max: 0.1
 
 boundary:
-  Sw_inlet: 0.8
+  Sw_inlet: 1
 
 scheme:
   type: upwind

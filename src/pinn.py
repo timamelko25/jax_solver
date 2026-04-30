@@ -88,30 +88,42 @@ class SaturationPINN:
         self.config = config
         self.flow_params = params
         self.dims = dims
-        input_dim = 3 if dims == "2d" else 2
+        input_dim = 4 if dims == "3d" else (3 if dims == "2d" else 2)
         self.network = SimpleMLP(
             layer_sizes=[input_dim] + [config.hidden_dim] * config.n_layers + [1],
             activation=config.activation,
         )
         self.opt_state = None
 
-    def predict(self, x: jnp.ndarray, y: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
-        """Predict saturation at (x, y, t)."""
+    def predict(
+        self, x: jnp.ndarray, y: jnp.ndarray, t: jnp.ndarray, z: jnp.ndarray = None
+    ) -> jnp.ndarray:
+        """Predict saturation at (x, y, t) or (x, y, z, t) for 3D."""
+        if self.dims == "3d" and z is not None:
+            return self.network(jnp.stack([x, y, z, t], axis=-1)).flatten()
         return self.network(jnp.stack([x, y, t], axis=-1)).flatten()
 
-    def pde_residual(self, x: jnp.ndarray, t: jnp.ndarray, params) -> jnp.ndarray:
-        """PDE residual: dS/dt + df/dx using finite differences."""
+    def pde_residual(
+        self, x: jnp.ndarray, t: jnp.ndarray, params, z: jnp.ndarray = None
+    ) -> jnp.ndarray:
+        """PDE residual: dS/dt + df/dx (1D/2D) or +df/dx+df/dy+df/dz (3D)."""
         dt_eps = 1e-4
         dx_eps = 1e-2
-        S_pred = self.predict(x, t)
-        S_plus_t = self.predict(x, t + dt_eps)
-        S_plus_x = self.predict(x + dx_eps, t)
-        S_minus_x = self.predict(x - dx_eps, t)
-        fw_plus = fractional_flow(S_plus_x, params)
-        fw_minus = fractional_flow(S_minus_x, params)
-        dS_dt = (S_plus_t - S_pred) / dt_eps
-        df_dx = (fw_plus - fw_minus) / (2 * dx_eps)
-        return dS_dt + df_dx
+        if self.dims == "3d" and z is not None:
+            S_pred = self.predict(x, y, t, z)
+            return _pde_residual_3d(
+                self.network.params, x, y, z, t, params, dt_eps, dx_eps, dx_eps, dx_eps
+            )
+        elif self.dims == "2d":
+            S_pred = self.predict(x, y, t)
+            return _pde_residual_2d(
+                self.network.params, x, y, t, params, dt_eps, dx_eps, dx_eps
+            )
+        else:
+            S_pred = self.predict(x, jnp.zeros_like(x), t)
+            return _pde_residual(
+                self.network.params, x, jnp.zeros_like(x), t, params, dims="1d"
+            )
 
     def boundary_loss(
         self, x_bc: jnp.ndarray, t_bc: jnp.ndarray, S_bc: jnp.ndarray
@@ -365,6 +377,63 @@ def _pde_residual(
         return dS_dt + df_dx
     else:
         return _pde_residual_2d(params, x, y, t, fw_params, dt_eps, dx_eps, dx_eps)
+
+
+def _pde_residual_3d(
+    params: tuple,
+    x: jnp.ndarray,
+    y: jnp.ndarray,
+    z: jnp.ndarray,
+    t: jnp.ndarray,
+    fw_params,
+    dt_eps=1e-4,
+    dx_eps=1e-2,
+    dy_eps=1e-2,
+    dz_eps=1e-2,
+) -> jnp.ndarray:
+    """3D PDE residual: dS/dt + d(f_w)/dx + d(f_w)/dy + d(f_w)/dz = 0"""
+    S_pred = _forward_batch_3d(params, x, y, z, t)
+
+    fw_plus_x = fractional_flow(
+        _forward_batch_3d(params, x + dx_eps, y, z, t), fw_params
+    )
+    fw_minus_x = fractional_flow(
+        _forward_batch_3d(params, x - dx_eps, y, z, t), fw_params
+    )
+
+    fw_plus_y = fractional_flow(
+        _forward_batch_3d(params, x, y + dy_eps, z, t), fw_params
+    )
+    fw_minus_y = fractional_flow(
+        _forward_batch_3d(params, x, y - dy_eps, z, t), fw_params
+    )
+
+    fw_plus_z = fractional_flow(
+        _forward_batch_3d(params, x, y, z + dz_eps, t), fw_params
+    )
+    fw_minus_z = fractional_flow(
+        _forward_batch_3d(params, x, y, z - dz_eps, t), fw_params
+    )
+
+    S_plus_t = _forward_batch_3d(params, x, y, z, t + dt_eps)
+
+    dS_dt = (S_plus_t - S_pred) / dt_eps
+    df_dx = (fw_plus_x - fw_minus_x) / (2 * dx_eps)
+    df_dy = (fw_plus_y - fw_minus_y) / (2 * dy_eps)
+    df_dz = (fw_plus_z - fw_minus_z) / (2 * dz_eps)
+
+    return dS_dt + df_dx + df_dy + df_dz
+
+
+def _forward_batch_3d(params, x, y, z, t):
+    """Forward pass for 3D PINN: input is (x, y, z, t)."""
+    x_in = jnp.stack([x, y, z, t], axis=-1)
+    for w, b in params[:-1]:
+        x_in = x_in @ w + b
+        x_in = jnp.tanh(x_in)
+    w, b = params[-1]
+    x_in = x_in @ w + b
+    return jnp.clip(x_in, 0.0, 1.0).flatten()
 
 
 def train_pinn(

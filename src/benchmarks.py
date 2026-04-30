@@ -14,7 +14,7 @@ Reference:
 
 import jax.numpy as jnp
 import numpy as onp
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from dataclasses import dataclass
 import os
 
@@ -344,3 +344,127 @@ def compare_with_analytical(data: Dict[str, jnp.ndarray], params) -> Dict[str, f
             "status": "partial",
             "error": str(e),
         }
+
+
+def load_big_model(data_dir: str = "data") -> Dict[str, Any]:
+    """Load BIG_MODEL_12_09_1 Eclipse dataset.
+
+    Args:
+        data_dir: Directory containing BIG_MODEL files
+
+    Returns:
+        Dictionary with:
+        - perm_x, perm_y, perm_z: permeability (nx, ny, nz)
+        - porosity: porosity (nx, ny, nz)
+        - x, y, z: grid coordinates
+        - nx, ny, nz: grid dimensions (122, 183, 43)
+        - summary: DataFrame from res2df
+    """
+    import re
+
+    import logging
+
+    logging.getLogger("res2df").setLevel(logging.CRITICAL)
+    import res2df
+    from res2df import ResdataFiles
+
+    if data_dir.endswith("BIG_MODEL_12_09_1"):
+        base = os.path.join(data_dir, "BIG_MODEL_12_09_1")
+    else:
+        base = os.path.join(data_dir, "BIG_MODEL_12_09_1", "BIG_MODEL_12_09_1")
+
+    # Parse DIMENS from DATA file
+    data_file = base + ".DATA"
+    with open(data_file, "r") as f:
+        content = f.read()
+
+    dims = re.findall(r"DIMENS\s+(\d+)\s+(\d+)\s+(\d+)", content)
+    if dims:
+        nx, ny, nz = int(dims[0][0]), int(dims[0][1]), int(dims[0][2])
+    else:
+        nx, ny, nz = 122, 183, 43  # defaults from DATA file
+
+    # Initialize placeholders
+    perm_x = onp.ones((nx, ny, nz)) * 100.0
+    perm_y = onp.ones((nx, ny, nz)) * 100.0
+    perm_z = onp.ones((nx, ny, nz)) * 10.0
+    porosity = onp.ones((nx, ny, nz)) * 0.2
+
+    try:
+        # Parse GRDECL files - handle ECLIPSE N*VALUE format
+        def parse_grdecl(filepath):
+            if not os.path.exists(filepath):
+                return None
+            values = []
+            with open(filepath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("--"):
+                        continue
+                    for token in line.split():
+                        if token == "/":
+                            break
+                        if "*" in token:
+                            parts = token.split("*")
+                            if len(parts) == 2:
+                                try:
+                                    count = int(parts[0])
+                                    val = float(parts[1])
+                                    values.extend([val] * count)
+                                except ValueError:
+                                    continue
+                        else:
+                            try:
+                                values.append(float(token))
+                            except ValueError:
+                                continue
+            return onp.array(values) if values else None
+
+        # Parse each property file
+        poro_arr = parse_grdecl(base + "_PROP_PORO.GRDECL")
+        permx_arr = parse_grdecl(base + "_PROP_PERMX.GRDECL")
+        permy_arr = parse_grdecl(base + "_PROP_PERMY.GRDECL")
+        permz_arr = parse_grdecl(base + "_PROP_PERMZ.GRDECL")
+
+        n_total = nx * ny * nz
+
+        if poro_arr is not None and len(poro_arr) == n_total:
+            porosity = poro_arr.reshape(nz, ny, nx).swapaxes(0, 2)
+        if permx_arr is not None and len(permx_arr) == n_total:
+            perm_x = permx_arr.reshape(nz, ny, nx).swapaxes(0, 2)
+        if permy_arr is not None and len(permy_arr) == n_total:
+            perm_y = permy_arr.reshape(nz, ny, nx).swapaxes(0, 2)
+        if permz_arr is not None and len(permz_arr) == n_total:
+            perm_z = permz_arr.reshape(nz, ny, nx).swapaxes(0, 2)
+    except Exception as e:
+        print(f"Warning: Could not parse GRDECL files: {e}")
+
+    # Try to load summary - suppress errors gracefully
+    summary = None
+    try:
+        unsmry_file = base + ".UNSMRY"
+        if os.path.exists(unsmry_file):
+            rf = ResdataFiles(unsmry_file)
+            summary = res2df.summary.df(rf, column_keys="*", time_index="raw")
+    except Exception:
+        pass
+
+    # Grid coordinates
+    x = onp.arange(nx) * 1.0
+    y = onp.arange(ny) * 1.0
+    z = onp.arange(nz) * 1.0
+
+    return {
+        "perm_x": jnp.array(perm_x),
+        "perm_y": jnp.array(perm_y),
+        "perm_z": jnp.array(perm_z),
+        "porosity": jnp.array(porosity),
+        "x": jnp.array(x),
+        "y": jnp.array(y),
+        "z": jnp.array(z),
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "summary": summary,
+        "base": base,
+    }

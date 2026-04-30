@@ -112,15 +112,20 @@ def generate_1d_numerical(
     dx = config.L / config.nx
     u = 1e-4
 
-    dt_cfl = 0.4 * dx / (u * 2.0)
+    from src.properties import fractional_flow
 
+    Sw_sample = jnp.linspace(params.Swc + 0.01, 1.0 - params.Sor - 0.01, config.nx)
+    df = jnp.abs(jnp.gradient(fractional_flow(Sw_sample, params), dx))
+    dt_cfl = min(0.4 * dx / (jnp.max(df * jnp.abs(u)) + 1e-10), config.t_max / 2.0)
+
+    n_steps = max(1, int(config.t_max / dt_cfl))
     Sw_history = simulate_1d_buckley_leverett(
         Sw_init,
         u,
         params,
         dt_cfl,
         dx,
-        int(config.t_max / dt_cfl),
+        n_steps,
         scheme=scheme,
         Sw_inj=1.0 - params.Sor,
     )

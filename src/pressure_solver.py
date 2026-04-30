@@ -1,78 +1,65 @@
-"""Pressure solver for elliptic equation in porous media.
+"""Pressure solver for 2D and 3D IMPES."""
 
-Solves: div(lambda(S) * grad(p)) = q
-
-Using finite difference discretization and iterative solvers.
-"""
-
-import jax.numpy as jnp
-from jax import jit
 from typing import Optional
-from .properties import FlowParams, compute_mobility
+import jax.numpy as jnp
+from jax import jit, lax
+from src.properties import FlowParams, compute_mobility
 
 
-@jit
 def solve_pressure_1d(
     Sw: jnp.ndarray,
+    perm: jnp.ndarray,
     params: FlowParams,
     q: jnp.ndarray,
     dx: float,
-    p_bc_left: float = 1e5,
-    p_bc_right: float = 0.0,
+    p_bc: Optional[jnp.ndarray] = None,
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> jnp.ndarray:
     """Solve pressure equation in 1D using Gauss-Seidel iteration.
 
-    Solves: d/dx(lambda(S) * dp/dx) = q
+    Solves: d/dx(lambda * dp/dx) = q
 
     Args:
-        Sw: Water saturation (n,)
+        Sw: Water saturation (nx,)
+        perm: Permeability (nx,)
         params: Flow parameters
-        q: Source term (n,)
+        q: Source term (nx,)
         dx: Grid spacing
-        p_bc_left: Pressure at left boundary
-        p_bc_right: Pressure at right boundary
+        p_bc: Boundary conditions (optional)
         max_iter: Maximum iterations
         tol: Convergence tolerance
 
     Returns:
-        Pressure field (n,)
+        Pressure field (nx,)
     """
-    n = Sw.shape[0]
+    nx = Sw.shape[0]
 
-    _, _, lambda_total = compute_mobility(Sw, params)
+    lambda_w, lambda_o, lambda_total = compute_mobility(Sw, params)
+    lambda_eff = lambda_total * perm
 
-    p = jnp.zeros(n)
-    p = p.at[0].set(p_bc_left)
-    p = p.at[-1].set(p_bc_right)
+    p = jnp.zeros(nx)
+    if p_bc is not None:
+        p = p.at[:].set(p_bc)
 
-    alpha = lambda_total * params.k / (params.phi * dx**2)
+    h2 = dx**2
 
     for _ in range(max_iter):
         p_old = p
 
-        p_left = p[:-2]
-        p_right = p[2:]
+        for i in range(1, nx - 1):
+            p_left = p[i - 1]
+            p_right = p[i + 1]
+            l_center = lambda_eff[i]
+            l_left = lambda_eff[i - 1]
+            l_right = lambda_eff[i + 1]
 
-        lambda_left = 0.5 * (lambda_total[:-1] + lambda_total[1:])[:-1]
-        lambda_right = 0.5 * (lambda_total[:-1] + lambda_total[1:])[1:]
+            denom = 2.0 * l_center / h2
+            denom = jnp.where(denom > 0, denom, 1e10)
 
-        rhs = q[1:-1]
+            p_new = (l_left * p_left / h2 + l_right * p_right / h2 - q[i]) / denom
 
-        denom = (
-            lambda_left
-            + lambda_right
-            + jnp.where(alpha[1:-1] > 0, 1.0 / alpha[1:-1], 1e10)
-        )
-
-        p_new = (
-            lambda_left * p_left
-            + lambda_right * p_right
-            + rhs / jnp.where(alpha[1:-1] > 0, alpha[1:-1], 1e10)
-        ) / denom
-
-        p = p.at[1:-1].set(p_new)
+            p = p.at[i].set(p_new)
 
         error = jnp.max(jnp.abs(p - p_old))
         if error < tol:
@@ -109,41 +96,50 @@ def compute_velocity_1d(
     return u_total, u_w
 
 
-def compute_velocity_2d(
-    p: jnp.ndarray,
-    lambda_total: jnp.ndarray,
-    lambda_w: jnp.ndarray,
-    dx: float,
-    dy: float,
-) -> tuple:
-    """Compute Darcy velocity from 2D pressure field.
+@jit
+def _solve_pressure_2d_jitted(p, lambda_x, lambda_y, q, dx, dy, max_iter, tol):
+    hx = dx**2
+    hy = dy**2
 
-    u = -lambda * grad(p)
+    def cond_func(state):
+        i, p, converged = state
+        return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
 
-    Args:
-        p: Pressure field (ny, nx)
-        lambda_total: Total mobility (ny, nx)
-        lambda_w: Water mobility (ny, nx)
-        dx: Grid spacing in x
-        dy: Grid spacing in y
+    def body_func(state):
+        i, p, converged = state
+        p_old = p
 
-    Returns:
-        Tuple of (u_total_x, u_total_y, u_w_x, u_w_y)
-        - u_total_x: (ny, nx-1)
-        - u_total_y: (ny-1, nx)
-        - u_w_x: (ny, nx-1)
-        - u_w_y: (ny-1, nx)
-    """
-    dp_dx = (p[:, 1:] - p[:, :-1]) / dx
-    dp_dy = (p[1:, :] - p[:-1, :]) / dy
+        p_left = p[1:-1, :-2]
+        p_right = p[1:-1, 2:]
+        p_down = p[:-2, 1:-1]
+        p_up = p[2:, 1:-1]
 
-    u_total_x = -lambda_total[:, :-1] * dp_dx
-    u_total_y = -lambda_total[:-1, :] * dp_dy
+        lx_left = lambda_x[1:-1, :-2]
+        lx_right = lambda_x[1:-1, 2:]
+        ly_down = lambda_y[:-2, 1:-1]
+        ly_up = lambda_y[2:, 1:-1]
 
-    u_w_x = -lambda_w[:, :-1] * dp_dx
-    u_w_y = -lambda_w[:-1, :] * dp_dy
+        denom = 2.0 * (lambda_x[1:-1, 1:-1] / hx + lambda_y[1:-1, 1:-1] / hy)
+        denom = jnp.where(denom > 0, denom, 1e10)
 
-    return u_total_x, u_total_y, u_w_x, u_w_y
+        p_new = (
+            lx_left * p_left / hx
+            + lx_right * p_right / hx
+            + ly_down * p_down / hy
+            + ly_up * p_up / hy
+            - q[1:-1, 1:-1]
+        ) / denom
+
+        p = p.at[1:-1, 1:-1].set(p_new)
+
+        error = jnp.max(jnp.abs(p - p_old))
+        converged = error < tol
+
+        return i + 1, p, converged
+
+    init_state = (0, p, False)
+    _, p_final, _ = lax.while_loop(cond_func, body_func, init_state)
+    return p_final
 
 
 def solve_pressure_2d(
@@ -158,7 +154,7 @@ def solve_pressure_2d(
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> jnp.ndarray:
-    """Solve pressure equation in 2D using Gauss-Seidel iteration.
+    """Solve pressure equation in 2D using vectorized Jacobi iteration.
 
     Solves: d/dx(lambda_x * dp/dx) + d/dy(lambda_y * dp/dy) = q
 
@@ -187,40 +183,219 @@ def solve_pressure_2d(
     if p_bc is not None:
         p = p.at[:].set(p_bc)
 
-    for _ in range(max_iter):
+    p = _solve_pressure_2d_jitted(p, lambda_x, lambda_y, q, dx, dy, max_iter, tol)
+
+    return p
+
+
+def compute_velocity_2d(
+    p: jnp.ndarray,
+    lambda_total: jnp.ndarray,
+    lambda_w: jnp.ndarray,
+    dx: float,
+    dy: float,
+) -> tuple:
+    """Compute Darcy velocity from 2D pressure field.
+
+    u = -lambda * grad(p)
+
+    Args:
+        p: Pressure field (ny, nx)
+        lambda_total: Total mobility (ny, nx)
+        lambda_w: Water mobility (ny, nx)
+        dx: Grid spacing in x
+        dy: Grid spacing in y
+
+    Returns:
+        Tuple of (u_total_x, u_total_y, u_w_x, u_w_y)
+    """
+    dp_dx = (p[:, 1:] - p[:, :-1]) / dx
+    dp_dy = (p[1:, :] - p[:-1, :]) / dy
+
+    u_total_x = -lambda_total[:, :-1] * dp_dx
+    u_total_y = -lambda_total[:-1, :] * dp_dy
+
+    u_w_x = -lambda_w[:, :-1] * dp_dx
+    u_w_y = -lambda_w[:-1, :] * dp_dy
+
+    return u_total_x, u_total_y, u_w_x, u_w_y
+
+
+@jit
+def _solve_pressure_3d_jitted(
+    p, lambda_x, lambda_y, lambda_z, q, dx, dy, dz, max_iter, tol
+):
+    """Vectorised 3D Jacobi iteration for pressure solver."""
+    hx = dx**2
+    hy = dy**2
+    hz = dz**2
+
+    nz, ny, nx = p.shape
+
+    def cond_func(state):
+        i, p, converged = state
+        return jnp.logical_and(i < max_iter, jnp.logical_not(converged))
+
+    def body_func(state):
+        i, p, converged = state
         p_old = p
 
-        p_left = p[1:-1, :-2]
-        p_right = p[1:-1, 2:]
-        p_down = p[:-2, 1:-1]
-        p_up = p[2:, 1:-1]
+        # Interior points: use actual neighbours
+        # x-neighbours: left = p[i,j,k-1], right = p[i,j,k+1]
+        p_left_int = jnp.zeros_like(p)
+        p_left_int = p_left_int.at[:, :, 1:].set(p[:, :, :-1])
+        p_left_int = p_left_int.at[:, :, 0].set(p[:, :, 0])  # Neumann BC
 
-        lx_center = lambda_x[1:-1, 1:-1]
-        lx_left = lambda_x[1:-1, :-2]
-        lx_right = lambda_x[1:-1, 2:]
+        p_right_int = jnp.zeros_like(p)
+        p_right_int = p_right_int.at[:, :, :-1].set(p[:, :, 1:])
+        p_right_int = p_right_int.at[:, :, -1].set(p[:, :, -1])  # Neumann BC
 
-        ly_center = lambda_y[1:-1, 1:-1]
-        ly_down = lambda_y[:-2, 1:-1]
-        ly_up = lambda_y[2:, 1:-1]
+        # y-neighbours
+        p_down_int = jnp.zeros_like(p)
+        p_down_int = p_down_int.at[:, 1:, :].set(p[:, :-1, :])
+        p_down_int = p_down_int.at[:, 0, :].set(p[:, 0, :])  # Neumann BC
 
-        hx = dx**2
-        hy = dy**2
+        p_up_int = jnp.zeros_like(p)
+        p_up_int = p_up_int.at[:, :-1, :].set(p[:, 1:, :])
+        p_up_int = p_up_int.at[:, -1, :].set(p[:, -1, :])  # Neumann BC
 
-        denom = 2 * (lx_center / hx + ly_center / hy)
+        # z-neighbours
+        p_back_int = jnp.zeros_like(p)
+        p_back_int = p_back_int.at[1:, :, :].set(p[:-1, :, :])
+        p_back_int = p_back_int.at[0, :, :].set(p[0, :, :])  # Neumann BC
+
+        p_front_int = jnp.zeros_like(p)
+        p_front_int = p_front_int.at[:-1, :, :].set(p[1:, :, :])
+        p_front_int = p_front_int.at[-1, :, :].set(p[-1, :, :])  # Neumann BC
+
+        lx = lambda_x
+        ly = lambda_y
+        lz = lambda_z
+
+        denom = 2.0 * (lx / hx + ly / hy + lz / hz)
         denom = jnp.where(denom > 0, denom, 1e10)
 
         p_new = (
-            lx_left * p_left / hx
-            + lx_right * p_right / hx
-            + ly_down * p_down / hy
-            + ly_up * p_up / hy
-            - q[1:-1, 1:-1]
+            lx * p_left_int / hx
+            + lx * p_right_int / hx
+            + ly * p_down_int / hy
+            + ly * p_up_int / hy
+            + lz * p_back_int / hz
+            + lz * p_front_int / hz
+            - q
         ) / denom
 
-        p = p.at[1:-1, 1:-1].set(p_new)
-
+        p = p_new
         error = jnp.max(jnp.abs(p - p_old))
-        if error < tol:
-            break
+        converged = error < tol
+
+        return i + 1, p, converged
+
+    init_state = (0, p, False)
+    _, p_final, _ = lax.while_loop(
+        lambda s: jnp.logical_and(s[0] < max_iter, jnp.logical_not(s[2])),
+        body_func,
+        init_state,
+    )
+    return p_final
+
+
+def solve_pressure_3d(
+    Sw: jnp.ndarray,
+    perm_x: jnp.ndarray,
+    perm_y: jnp.ndarray,
+    perm_z: jnp.ndarray,
+    params: FlowParams,
+    q: jnp.ndarray,
+    dx: float,
+    dy: float,
+    dz: float,
+    p_bc: Optional[jnp.ndarray] = None,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> jnp.ndarray:
+    """Solve pressure equation in 3D using vectorised Jacobi iteration.
+
+    Solves: d/dx(lambda_x * dp/dx) + d/dy(lambda_y * dp/dy) + d/dz(lambda_z * dp/dz) = q.
+
+    Uses vectorised Jacobi iteration with Neumann BC (zero gradient) at all boundaries.
+
+    Args:
+        Sw: Water saturation (nz, ny, nx)
+        perm_x: Permeability in x-direction (nz, ny, nx)
+        perm_y: Permeability in y-direction (nz, ny, nx)
+        perm_z: Permeability in z-direction (nz, ny, nx)
+        params: Flow parameters
+        q: Source term (nz, ny, nx)
+        dx, dy, dz: Grid spacing
+        p_bc: Boundary conditions (optional)
+        max_iter: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        Pressure field (nz, ny, nx)
+    """
+    nz, ny, nx = Sw.shape[0], Sw.shape[1], Sw.shape[2]
+
+    lambda_w, lambda_o, lambda_total = compute_mobility(Sw, params)
+
+    lambda_x = lambda_total * perm_x
+    lambda_y = lambda_total * perm_y
+    lambda_z = lambda_total * perm_z
+
+    p = jnp.zeros((nz, ny, nx))
+    if p_bc is not None:
+        p = p.at[:].set(p_bc)
+
+    p = _solve_pressure_3d_jitted(
+        p, lambda_x, lambda_y, lambda_z, q, dx, dy, dz, max_iter, tol
+    )
 
     return p
+
+
+def compute_velocity_3d(
+    p: jnp.ndarray,
+    lambda_total: jnp.ndarray,
+    lambda_w: jnp.ndarray,
+    dx: float,
+    dy: float,
+    dz: float,
+) -> tuple:
+    """Compute Darcy velocity from 3D pressure field.
+
+    u = -lambda * grad(p)
+
+    Args:
+        p: Pressure field (nz, ny, nx)
+        lambda_total: Total mobility (nz, ny, nx)
+        lambda_w: Water mobility (nz, ny, nx)
+        dx, dy, dz: Grid spacing
+
+    Returns:
+        Tuple of (u_total, u_w) - magnitude at cell centers.
+    """
+    # Gradients at cell centers using central differences
+    dp_dx = jnp.zeros_like(p)
+    dp_dx = dp_dx.at[:, :, 1:-1].set((p[:, :, 2:] - p[:, :, :-2]) / (2 * dx))
+
+    dp_dy = jnp.zeros_like(p)
+    dp_dy = dp_dy.at[:, 1:-1, :].set((p[:, 2:, :] - p[:, :-2, :]) / (2 * dy))
+
+    dp_dz = jnp.zeros_like(p)
+    dp_dz = dp_dz.at[1:-1, :, :].set((p[2:, :, :] - p[:-2, :, :]) / (2 * dz))
+
+    # Velocity magnitude at cell centers
+    u_total_x = -lambda_total * dp_dx
+    u_total_y = -lambda_total * dp_dy
+    u_total_z = -lambda_total * dp_dz
+
+    u_w_x = -lambda_w * dp_dx
+    u_w_y = -lambda_w * dp_dy
+    u_w_z = -lambda_w * dp_dz
+
+    # Magnitude
+    u_total = jnp.sqrt(u_total_x**2 + u_total_y**2 + u_total_z**2)
+    u_w = jnp.sqrt(u_w_x**2 + u_w_y**2 + u_w_z**2)
+
+    return u_total, u_w

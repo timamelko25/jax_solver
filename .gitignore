@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+*.md
+outputs/
+
+.opencode
+.sisyphus
+data/BIG_MODEL_12_09_1

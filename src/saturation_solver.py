@@ -280,3 +280,103 @@ def upwind_step_2d(
     Sw_new = jnp.minimum(Sw_new, 1.0 - params.Sor)
 
     return Sw_new
+
+def upwind_step_3d(
+    Sw: jnp.ndarray,
+    u: jnp.ndarray,
+    params: FlowParams,
+    dt: float,
+    dx: float,
+    dy: float,
+    dz: float,
+    Sw_inj: float = 1.0,
+) -> jnp.ndarray:
+    """3D upwind scheme for Buckley-Leverett equation.
+
+    dS/dt + d/dx(f_w(S)) + d/dy(f_w(S)) + d/dz(f_w(S)) = 0.
+
+    Uses dimensional splitting (operator split): x, then y, then z.
+    Fluxes computed at cell faces using upwind.
+
+    Args:
+        Sw: Water saturation at time n (nz, ny, nx)
+        u: Darcy velocity magnitude (nz, ny, nx) at cell centers
+        params: Flow parameters
+        dt: Time step
+        dx, dy, dz: Grid spacing
+        Sw_inj: Injected saturation at inlet.
+
+    Returns:
+        Updated saturation at time n+1 (nz, ny, nx)
+    """
+    nz, ny, nx = Sw.shape[0], Sw.shape[1], Sw.shape[2]
+
+    f_w = fractional_flow(Sw, params)
+
+    # X-direction update (upwind)
+    Sw_x = Sw.copy()
+    for i in range(nz):
+        for j in range(ny):
+            # Velocities at faces: u[i,j,0]...u[i,j,nx-1]
+            # Fluxes at faces 1/2, 3/2, ..., (nx-1/2): use upwind
+            u_row = u[i, j, :]  # (nx,) at cell centers
+            
+            # Flux at face k+1/2 uses velocity at that face (simplified: use left cell velocity)
+            # For upwind: if u > 0, flux uses f_w at left cell; if u < 0, uses right cell
+            f_left = f_w[i, j, :-1]   # f at cell k (shape nx-1)
+            f_right = f_w[i, j, 1:]   # f at cell k+1 (shape nx-1)
+            
+            # Flux at faces 1/2... (nx-1/2): use u at left cell center, upwind f_w
+            flux_faces = jnp.where(u_row[:-1] > 0, u_row[:-1] * f_left, u_row[:-1] * f_right)
+            
+            # Now flux_faces has shape (nx-1,) - flux at internal faces
+            # Divergence: dS/dx = (flux[k+1/2] - flux[k-1/2]) / dx
+            # flux array indexed by face: flux[0]=0 (inlet), flux[1..nx-1]=flux_faces, flux[nx]=0 (outlet)
+            flux_full = jnp.zeros(nx + 1)
+            flux_full = flux_full.at[1:nx].set(flux_faces)
+            
+            dS = (flux_full[1:] - flux_full[:-1]) / dx  # shape (nx,)
+            Sw_x = Sw_x.at[i, j, :].set(Sw_x[i, j, :] - dt * dS)
+
+    # Y-direction update
+    Sw_xy = Sw_x.copy()
+    for i in range(nz):
+        for k in range(nx):
+            u_col = u[i, :, k]  # (ny,) at cell centers
+            f_down = f_w[i, :-1, k]  # (ny-1,)
+            f_up = f_w[i, 1:, k]    # (ny-1,)
+            
+            flux_faces = jnp.where(u_col[:-1] > 0, u_col[:-1] * f_down, u_col[:-1] * f_up)
+            flux_full = jnp.zeros(ny + 1)
+            flux_full = flux_full.at[1:ny].set(flux_faces)
+            
+            dS = (flux_full[1:] - flux_full[:-1]) / dy  # shape (ny,)
+            Sw_xy = Sw_xy.at[i, :, k].set(Sw_xy[i, :, k] - dt * dS)
+
+    # Z-direction update
+    Sw_xyz = Sw_xy.copy()
+    for j in range(ny):
+        for k in range(nx):
+            u_col = u[:, j, k]  # (nz,) at cell centers
+            f_back = f_w[:-1, j, k]  # (nz-1,)
+            f_front = f_w[1:, j, k]  # (nz-1,)
+            
+            flux_faces = jnp.where(u_col[:-1] > 0, u_col[:-1] * f_back, u_col[:-1] * f_front)
+            flux_full = jnp.zeros(nz + 1)
+            flux_full = flux_full.at[1:nz].set(flux_faces)
+            
+            dS = (flux_full[1:] - flux_full[:-1]) / dz  # shape (nz,)
+            Sw_xyz = Sw_xyz.at[:, j, k].set(Sw_xyz[:, j, k] - dt * dS)
+
+    # Apply boundary conditions
+    Sw_new = Sw_xyz
+    # Inlet face (x=0): inject at Sw_inj
+    Sw_new = Sw_new.at[:, :, 0].set(Sw_inj)
+
+    # Clip to valid range
+    Sw_new = jnp.maximum(Sw_new, params.Swc)
+    Sw_new = jnp.minimum(Sw_new, 1.0 - params.Sor)
+
+    return Sw_new
+
+
