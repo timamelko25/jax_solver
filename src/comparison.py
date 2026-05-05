@@ -49,7 +49,7 @@ def compare_schemes(
     dx = L / nx
     nt = int(t_max / dt)
 
-    Sw_init = jnp.full(nx, params.Swc)
+    Sw_init = jnp.full(nx, params.Swc + params.Sor)
 
     n_times = nt + 1
     time_array = jnp.linspace(0, t_max, n_times)
@@ -75,6 +75,7 @@ def compare_schemes(
             "Sw_history": Sw_history,
             "time_array": time_array,
             "x": x_array,
+            "t_max": t_max,
         }
 
     return results

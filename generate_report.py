@@ -341,14 +341,51 @@ def section_3_1d_simulation(output_dir="outputs"):
 
     Sw_inj = 1.0 - params.Sor
     Sw_init_val = params.Swc + params.Sor
-    S_shock, v_shock = welge_construct(Sw_inj, Sw_init_val, params)
+    S_shock, v_shock_dim = welge_construct(Sw_inj, Sw_init_val, params)
+    v_shock_phys = v_shock_dim * u / params.phi  # physical velocity (m/s)
 
     print(f"""
 3.1 Конструкция Велге (аналитическое решение):
     - Насыщенность на фронте: S_shock = {S_shock:.4f}
-    - Скорость фронта: v_shock = {v_shock:.2e} м/с
+    - Скорость фронта (безразмерная): v_shock* = {v_shock_dim:.4f}
+    - Скорость фронта (физическая): v_shock = {v_shock_phys:.2e} м/с
     - Отношение подвижностей: M = μ_o/μ_w = {params.mu_o / params.mu_w:.1f}
+
+3.2 Численные показатели по схемам:
 """)
+
+    # Численные показатели по схемам
+    def extract_shock_metrics(Sw, x, t, params):
+        """Extract shock saturation, velocity, and front position from numerical solution."""
+        sw_arr = onp.array(Sw)
+        x_arr = onp.array(x)
+        S_shock_num = float(onp.max(sw_arr))
+        # Front position: max gradient, skipping first 3 cells (inlet BC)
+        grad = onp.abs(onp.gradient(sw_arr, x_arr))
+        grad[:3] = 0.0
+        front_idx = int(onp.argmax(grad))
+        x_front = float(x_arr[front_idx])
+        v_shock_num = x_front / t if t > 0 else 0.0
+        return S_shock_num, v_shock_num, x_front
+
+    schemes = ["upwind", "tvd", "rusanov"]
+    for scheme in schemes:
+        Sw_hist_num = simulate_1d_buckley_leverett(
+            Sw_init, u, params, dt, dx, nt, scheme=scheme, Sw_inj=Sw_inj
+        )
+        Sw_final = Sw_hist_num[-1]
+        s_num, v_num, x_f = extract_shock_metrics(
+            onp.array(Sw_final), onp.array(x), t_max, params
+        )
+        print(f"  Схема {scheme}:")
+        print(
+            f"    - Насыщенность на фронте: S_shock = {s_num:.4f} (ошибка: {abs(s_num - S_shock):.4f})"
+        )
+        print(
+            f"    - Скорость фронта: v_shock = {v_num:.2e} м/с (ошибка: {abs(v_num - v_shock_phys):.2e})"
+        )
+        print(f"    - Положение фронта: x_front = {x_f:.2f} м")
+    print()
 
 
 def section_3_1d_scheme_comparison(output_dir="outputs"):
@@ -358,9 +395,12 @@ def section_3_1d_scheme_comparison(output_dir="outputs"):
     print("============================================================")
 
     from src.comparison import compare_schemes
+    from src.properties import FlowParams
 
     schemes = ["upwind", "tvd", "rusanov"]
     print(f"Запуск сравнения схем: {schemes}")
+
+    params = FlowParams()
 
     results = compare_schemes(
         schemes=schemes,
@@ -787,12 +827,7 @@ def section_8_conclusions():
 3) PINN успешно обучается физике двухфазного течения,
    комбинируя данные и PDE residuals
 
-4) Датасет BIG_MODEL_12_09_1 полностью интегрирован:
-   - Чтение формата Eclipse (.GRDECL, .DATA)
-   - Визуализация через ResInsight (VTK экспорт)
-   - 2D и 3D решатели работают с реальными данными
-
-5) Сходимость: 1D схемы показывают ожидаемый порядок
+4) Сходимость: 1D схемы показывают ожидаемый порядок
    (первый порядок для upwind, выше для TVD)
 """)
 

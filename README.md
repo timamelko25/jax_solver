@@ -32,4 +32,18 @@ Related works
 
 # Run
 
-Для старта программы предусмотрена единая точка входа с потсроением минимальных решений - `python3 generate_report.py`
+Для старта программы предусмотрена единая точка входа с построением минимальных решений:
+```
+pip install -r requirements.txt
+
+python3 generate_report.py
+```
+
+
+## Report
+
+
+### 1D задача Бакли-Леверетта
+График аналитичсеского решения - `outputs/report_1d_solution.png`
+
+Сравнение численных методов решения уравнения - `outputs/scheme_comparison.png`
