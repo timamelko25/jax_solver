@@ -389,30 +389,42 @@ def section_3_1d_simulation(output_dir="outputs"):
 
 
 def section_3_1d_scheme_comparison(output_dir="outputs"):
-    """Generate scheme_comparison.png comparing upwind, TVD, Rusanov schemes."""
+    """Generate scheme_comparison.png comparing upwind, TVD, Rusanov with analytical."""
     print("============================================================")
-    print("3.1 СРАВНЕНИЕ СХЕМ (SCHEME COMPARISON)")
+    print("3.1 СРАВНЕНИЕ СХЕМ С АНАЛИТИЧЕСКИМ РЕШЕНИЕМ ВЕЛГЕ")
     print("============================================================")
 
     from src.comparison import compare_schemes
-    from src.properties import FlowParams
+    from src.properties import FlowParams, welge_construct
 
     schemes = ["upwind", "tvd", "rusanov"]
     print(f"Запуск сравнения схем: {schemes}")
 
     params = FlowParams()
+    u = 1e-4
+    t_max = 0.05
+    L = 10.0
 
     results = compare_schemes(
         schemes=schemes,
         nx=100,
-        L=10.0,
+        L=L,
         dt=0.0005,
-        t_max=0.05,
-        u=1e-4,
+        t_max=t_max,
+        u=u,
     )
 
+    Sw_inj = 1.0 - params.Sor
+    Sw_init_val = params.Swc + params.Sor
+    S_shock, v_shock = welge_construct(Sw_inj, Sw_init_val, params)
+    v_actual = u * v_shock
+    x_shock = v_actual * t_max
+
+    x_fine = onp.linspace(0, L, 1000)
+    Sw_analytical = onp.where(x_fine < x_shock, Sw_inj, Sw_init_val)
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    x = onp.linspace(0, 10, 100)
+    x = onp.linspace(0, L, 100)
 
     for scheme in schemes:
         if scheme in results:
@@ -421,15 +433,33 @@ def section_3_1d_scheme_comparison(output_dir="outputs"):
         else:
             print(f"Предупреждение: нет результатов для схемы {scheme}")
 
+    ax.plot(x_fine, Sw_analytical, "k--", linewidth=2, label="Welge analytical")
+
     ax.set_xlabel("Position x (m)", fontsize=12)
     ax.set_ylabel("Water Saturation Sw", fontsize=12)
-    ax.set_title("Scheme Comparison (t=0.05)", fontsize=14)
+    ax.set_title("Сравнение схем с аналитическим решением Велге (t=0.05)", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(f"{output_dir}/scheme_comparison.png", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Сохранен: {output_dir}/scheme_comparison.png")
+
+    print(f"""
+3.1 Параметры аналитического решения:
+    - Насыщенность на фронте: S_shock = {S_shock:.4f}
+    - Скорость фронта: v_shock = {v_shock:.4f}
+    - Положение фронта: x_shock = {x_shock:.4f} м (при t={t_max})
+""")
+
+    print("Ошибки численных схем относительно аналитического решения (L2):")
+    x_grid = onp.linspace(0, L, 100)
+    Sw_ana_grid = onp.where(x_grid < x_shock, Sw_inj, Sw_init_val)
+    for scheme in schemes:
+        Sw_final = onp.array(results[scheme]["Sw_history"][-1])
+        l2 = onp.sqrt(onp.mean((Sw_final - Sw_ana_grid) ** 2))
+        print(f"  {scheme}: L2 = {l2:.6f}")
+    print()
 
 
 def section_4_2d_simulation(output_dir="outputs"):
@@ -631,10 +661,10 @@ def section_5_big_model(output_dir="outputs"):
         Lx=60.0,
         Ly=90.0,
         dt=0.001,
-        t_max=0.01,
+        t_max=0.05,
         q_injection=1e-4,
         scheme="upwind",
-        save_interval=10,
+        save_interval=2,
     )
     result = solve_big_model_2d(
         data_dir="data/BIG_MODEL_12_09_1", k_layer=k_layer, config=config_2d
@@ -700,19 +730,218 @@ def section_6_pinn(output_dir="outputs"):
     print(f"Обучающие данные: {len(data['x'])} samples")
 
     t0 = time.time()
-    train_pinn(data, params, config, dims="2d", verbose=True)
+    pinn, loss_history = train_pinn(data, params, config, dims="2d", verbose=True)
     t1 = time.time()
 
     print(f"""
 Результаты обучения PINN:
 - Эпох: {config.n_iterations}
 - Время обучения: {t1 - t0:.2f}с
-- Функция потерь: PINN комбинирует:
-  * Data loss: MSE(S_pred, S_true)
-  * Physics loss: MSE(∂S/∂t + ∂f_w/∂x + ∂f_w/∂y)
-  * BC loss: MSE(S_BC_pred, S_BC)
-  * Entropy loss: ||max(-∂S/∂t, 0)||²
+
+Учёт Data Loss:
+  Data loss = MSE(S_pred, S_true) — среднеквадратичная ошибка между
+  предсказанием нейросети и эталонным IMPES-решением.
+  
+  Эталонные данные создаются автоматически: IMPESSolver2D запускается
+  на SPE10 (100×20), затем из 4D тензора (x, y, t, Sw) случайно
+  выбирается {len(data["x"])} точек. Таким образом, data loss
+  привязывает PINN к численному решению, не требуя внешнего датасета.
+
+  Итоговая функция потерь (L_total = L_data + λ₁·L_pde + λ₂·L_bc + λ₃·L_entropy):
+  * Data loss (λ=1.0):       MSE(S_pred, S_true) — данные IMPES
+  * Physics loss (λ=0.1):    MSE(∂S/∂t + ∂f_w/∂x + ∂f_w/∂y) — невязка PDE
+  * BC loss (λ=1.0):         MSE(S_BC_pred, S_BC) — граничные условия
+  * Entropy loss (λ=0.05):   ||max(-∂S/∂t, 0)||² — условие энтропии
 """)
+
+
+def section_6b_pinn_vs_impes(output_dir="outputs"):
+    """Compare PINN solution with numerical IMPES solution."""
+    print("=" * 70)
+    print("6b. СРАВНЕНИЕ PINN С ЧИСЛЕННЫМ РЕШЕНИЕМ (IMPES)")
+    print("=" * 70)
+
+    from src.pinn import train_pinn, create_training_data_2d, PINNConfig
+    from src.solver import IMPESSolver2D, SimulationConfig2D
+    from src.benchmarks import load_spe10_case1
+    from src.properties import FlowParams
+    import time
+
+    print("Обучение PINN на 2D данных (SPE10)...")
+    config = PINNConfig(n_iterations=2000)
+    params = FlowParams()
+
+    data = create_training_data_2d(n_points=500)
+
+    t0 = time.time()
+    pinn, loss_history = train_pinn(data, params, config, dims="2d", verbose=False)
+    t1 = time.time()
+    print(f"PINN обучен за {t1 - t0:.2f}с")
+
+    if loss_history:
+        fig_loss, ax_loss = plt.subplots(figsize=(10, 6))
+        iters = [lh[0] for lh in loss_history]
+        losses = [lh[1] for lh in loss_history]
+        ax_loss.semilogy(iters, losses, "b-", linewidth=2)
+        ax_loss.set_xlabel("Iteration", fontsize=12)
+        ax_loss.set_ylabel("Loss", fontsize=12)
+        ax_loss.set_title("PINN Training Loss", fontsize=14)
+        ax_loss.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(
+            f"{output_dir}/report_pinn_loss_6b.png", dpi=150, bbox_inches="tight"
+        )
+        plt.close()
+        print(f"Сохранен: {output_dir}/report_pinn_loss_6b.png")
+
+    print("Запуск IMPES решателя (SPE10, 100x20)...")
+    spe10 = load_spe10_case1("data")
+    config_impes = SimulationConfig2D(
+        nx=100,
+        ny=20,
+        Lx=100.0,
+        Ly=20.0,
+        dt=0.001,
+        t_max=0.005,
+        q_injection=1e-4,
+        scheme="upwind",
+        save_interval=1,
+    )
+    solver = IMPESSolver2D(params, config_impes, spe10["perm_x"].T, spe10["perm_y"].T)
+    Sw_init = jnp.full((config_impes.ny, config_impes.nx), params.Swc)
+    Sw_init = Sw_init.at[:, :3].set(1.0 - params.Sor)
+    time_arr, Sw_hist, _ = solver.run(Sw_init)
+    print(f"IMPES: {len(time_arr)} временных срезов")
+
+    print("Оценка PINN на сетке IMPES...")
+    X, Y = onp.meshgrid(onp.array(solver.x), onp.array(solver.y), indexing="ij")
+    x_flat = jnp.array(X.flatten())
+    y_flat = jnp.array(Y.flatten())
+
+    Sw_pinn_history = []
+    for t_val in time_arr:
+        t_flat = jnp.full_like(x_flat, t_val)
+        Sw_pinn = pinn.predict(x_flat, y_flat, t_flat)
+        Sw_pinn_history.append(
+            onp.array(Sw_pinn).reshape(config_impes.nx, config_impes.ny).T
+        )
+
+    errors = []
+    for i in range(len(time_arr)):
+        Sw_impes_np = onp.array(Sw_hist[i])
+        Sw_pinn_np = Sw_pinn_history[i]
+        l2 = onp.sqrt(onp.mean((Sw_pinn_np - Sw_impes_np) ** 2))
+        linf = onp.max(onp.abs(Sw_pinn_np - Sw_impes_np))
+        errors.append((float(time_arr[i]), float(l2), float(linf)))
+
+    print()
+    print("Сравнение PINN vs IMPES:")
+    print("   t      |  L2 error  |  Max error")
+    print("-" * 40)
+    for t, l2, linf in errors:
+        print(f"  {t:.4f} |  {l2:.6f}  |  {linf:.6f}")
+    print()
+
+    print("Генерация отчета сравнения...")
+
+    n_times = min(3, len(time_arr))
+    time_indices = onp.linspace(0, len(time_arr) - 1, n_times).astype(int)
+
+    fig, axes = plt.subplots(3, n_times, figsize=(5 * n_times, 12))
+    if n_times == 1:
+        axes = axes.reshape(-1, 1)
+
+    for j, idx in enumerate(time_indices):
+        t = float(time_arr[idx])
+
+        im1 = axes[0, j].pcolormesh(
+            onp.array(solver.x),
+            onp.array(solver.y),
+            onp.array(Sw_hist[idx]),
+            cmap="Blues",
+            vmin=0.2,
+            vmax=0.8,
+            shading="gouraud",
+        )
+        axes[0, j].set_title(f"IMPES (t={t:.4f})", fontsize=10)
+        axes[0, j].set_xlabel("x")
+        axes[0, j].set_ylabel("y")
+        plt.colorbar(im1, ax=axes[0, j])
+
+        im2 = axes[1, j].pcolormesh(
+            onp.array(solver.x),
+            onp.array(solver.y),
+            Sw_pinn_history[idx],
+            cmap="Blues",
+            vmin=0.2,
+            vmax=0.8,
+            shading="gouraud",
+        )
+        axes[1, j].set_title(f"PINN (t={t:.4f})", fontsize=10)
+        axes[1, j].set_xlabel("x")
+        axes[1, j].set_ylabel("y")
+        plt.colorbar(im2, ax=axes[1, j])
+
+        diff = Sw_pinn_history[idx] - onp.array(Sw_hist[idx])
+        vmax = max(abs(diff.min()), abs(diff.max())) or 0.1
+        im3 = axes[2, j].pcolormesh(
+            onp.array(solver.x),
+            onp.array(solver.y),
+            diff,
+            cmap="RdBu_r",
+            vmin=-vmax,
+            vmax=vmax,
+            shading="gouraud",
+        )
+        axes[2, j].set_title(f"Разность (t={t:.4f})", fontsize=10)
+        axes[2, j].set_xlabel("x")
+        axes[2, j].set_ylabel("y")
+        plt.colorbar(im3, ax=axes[2, j])
+
+    plt.suptitle("Сравнение PINN и IMPES решений", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/report_pinn_vs_impes.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Сохранен: {output_dir}/report_pinn_vs_impes.png")
+
+    mid_y = config_impes.ny // 2
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+
+    colors = plt.cm.viridis(onp.linspace(0, 1, n_times))
+    for j, idx in enumerate(time_indices):
+        t = float(time_arr[idx])
+        ax2.plot(
+            onp.array(solver.x),
+            onp.array(Sw_hist[idx, mid_y, :]),
+            "--",
+            color=colors[j],
+            linewidth=2,
+            label=f"IMPES t={t:.4f}",
+        )
+        ax2.plot(
+            onp.array(solver.x),
+            Sw_pinn_history[idx][mid_y, :],
+            "-",
+            color=colors[j],
+            linewidth=1.5,
+            alpha=0.7,
+            label=f"PINN t={t:.4f}",
+        )
+
+    ax2.set_xlabel("x (м)", fontsize=12)
+    ax2.set_ylabel("S_w", fontsize=12)
+    ax2.set_title(
+        f"Профиль насыщенности при y={float(solver.y[mid_y]):.1f} м", fontsize=14
+    )
+    ax2.legend(fontsize=9, ncol=2)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim([0.15, 1.0])
+    plt.tight_layout()
+    plt.savefig(
+        f"{output_dir}/report_pinn_vs_impes_profile.png", dpi=150, bbox_inches="tight"
+    )
+    plt.close()
+    print(f"Сохранен: {output_dir}/report_pinn_vs_impes_profile.png")
 
 
 def section_7_convergence(output_dir="outputs"):
@@ -725,7 +954,12 @@ def section_7_convergence(output_dir="outputs"):
 
     print("7.1 Исследование сходимости по сетке (Grid Refinement)...")
     grid_results = run_grid_refinement_study(
-        base_nx=20, refine_factors=[2, 4, 8], dt=0.01, t_max=0.3, t_compare=0.2, L=10.0
+        base_nx=20,
+        refine_factors=[2, 4, 8, 16, 32],
+        base_dt=0.01,
+        t_max=0.3,
+        t_compare=0.2,
+        L=10.0,
     )
 
     print("    nx |         dx |           L1 |           L2 |          Max")
@@ -847,6 +1081,7 @@ def generate_full_report(output_dir="outputs"):
     section_4_2d_scenario_comparison(output_dir)
     section_5_big_model(output_dir)
     section_6_pinn(output_dir)
+    section_6b_pinn_vs_impes(output_dir)
     section_7_convergence(output_dir)
     section_8_conclusions()
 
@@ -867,6 +1102,9 @@ def generate_full_report(output_dir="outputs"):
 - convergence_study.png
 - scheme_comparison.png
 - scenario_comparison.png
+- report_pinn_loss_6b.png
+- report_pinn_vs_impes.png
+- report_pinn_vs_impes_profile.png
 """)
 
 
@@ -886,7 +1124,21 @@ Examples:
         "--section",
         type=str,
         default="all",
-        choices=["all", "1", "2", "2b", "3", "4", "5", "6", "7", "8", "3.1", "4.1"],
+        choices=[
+            "all",
+            "1",
+            "2",
+            "2b",
+            "3",
+            "4",
+            "5",
+            "6",
+            "6b",
+            "7",
+            "8",
+            "3.1",
+            "4.1",
+        ],
         help="Which section to run (default: all)",
     )
 
@@ -927,6 +1179,8 @@ Examples:
         section_5_big_model(output_dir)
     elif args.section == "6":
         section_6_pinn(output_dir)
+    elif args.section == "6b":
+        section_6b_pinn_vs_impes(output_dir)
     elif args.section == "7":
         section_7_convergence(output_dir)
     elif args.section == "8":

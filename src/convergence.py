@@ -21,7 +21,7 @@ def welge_analytical_solution(
 
     S_shock, v_shock = welge_construct(Sw_inj, Sw_init, params)
 
-    v_actual = u * v_shock / params.phi
+    v_actual = u * v_shock
 
     dx = L / nx
     x_array = jnp.linspace(dx / 2, L - dx / 2, nx)
@@ -55,7 +55,7 @@ def run_grid_refinement_study(
     refine_factors: list = None,
     t_compare: float = 0.03,
     L: float = 100.0,
-    dt: float = 0.001,
+    base_dt: float = 0.001,
     t_max: float = 0.05,
     Sw_inj: float = 1.0,
     Sw_init: float = None,
@@ -75,6 +75,7 @@ def run_grid_refinement_study(
     for factor in refine_factors:
         nx = base_nx * factor
         dx = L / nx
+        dt = base_dt / factor
 
         Sw_init_arr = jnp.full(nx, Sw_init)
 

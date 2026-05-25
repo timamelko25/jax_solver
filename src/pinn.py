@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as onp
 from jax import value_and_grad
 from jax import random
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 from dataclasses import dataclass
 
 from .properties import fractional_flow, FlowParams
@@ -442,7 +442,7 @@ def train_pinn(
     config: Optional[PINNConfig] = None,
     dims: str = "2d",
     verbose: bool = True,
-) -> SaturationPINN:
+) -> Tuple[SaturationPINN, List[Tuple[int, float]]]:
     """Train PINN with physics-informed Adam optimizer.
 
     Args:
@@ -520,6 +520,7 @@ def train_pinn(
         return loss_data + pw * loss_physics + bcw * loss_bc + ew * loss_entropy
 
     prev_loss = float("inf")
+    loss_history: List[Tuple[int, float]] = []
 
     for iteration in range(config.n_iterations):
         loss, grads = value_and_grad(total_loss)(net_params)
@@ -546,19 +547,20 @@ def train_pinn(
         )
 
         if verbose and (iteration % 1000 == 0 or iteration == config.n_iterations - 1):
-            delta = abs(loss - prev_loss)
+            loss_val = float(loss)
+            delta = abs(loss_val - prev_loss)
+            loss_history.append((iteration, loss_val))
             print(
-                f"Iter {iteration:5d}: loss={float(loss):.6f} "
-                f"(delta={float(delta):.2e})"
+                f"Iter {iteration:5d}: loss={loss_val:.6f} (delta={float(delta):.2e})"
             )
-            prev_loss = float(loss)
+            prev_loss = loss_val
 
     pinn.network.params = net_params
 
     if verbose:
         print("Training completed!")
 
-    return pinn
+    return pinn, loss_history
 
 
 def train_pinn_inverse(
