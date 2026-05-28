@@ -774,7 +774,7 @@ def section_6b_pinn_vs_impes(output_dir="outputs"):
     data = create_training_data_2d(n_points=500)
 
     t0 = time.time()
-    pinn, loss_history = train_pinn(data, params, config, dims="2d", verbose=False)
+    pinn, loss_history = train_pinn(data, params, config, dims="2d", verbose=True)
     t1 = time.time()
     print(f"PINN обучен за {t1 - t0:.2f}с")
 
